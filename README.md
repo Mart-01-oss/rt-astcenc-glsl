@@ -19,7 +19,7 @@ Demo:
 ![screenshot.jpg](screenshot.jpg)
 
 **ASTC Encoded**
-![decoded_screenshot.jpg](decoded_screenshot.jpg)
+![decoded_screenshot.png](decoded_screenshot.png)
 
 ### Stages
 
