@@ -8,6 +8,8 @@ const uint WEIGHT_BITS_TRANS  = 4; // RANGE_16
 
 layout(std140, binding = 0) uniform CParams {
     uint g_num_total_blocks;
+    uint g_use_pca;           // 0 = AABB, 1 = PCA
+    uint g_use_dithering;     // 0 = off, 1 = on
 };
 
 // Input: Uncompressed pixels (B, 16, 4)
@@ -45,16 +47,39 @@ shared uint s_reduce_alpha_check[64];
 shared vec4 s_reduce_min[64];
 shared vec4 s_reduce_max[64];
 
+// For PCA
+shared vec4 s_mean[4];
+shared float s_projections[64];
+
+const float DITHER_MATRIX[16] = float[16](
+     0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+    12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+     3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+    15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0
+);
+
 
 uint quantize_to_index(float value, uint bits) {
     if (bits == 0) return 0;
-    float max_val = float((1 << bits) - 1);
+    float max_val = float((1u << bits) - 1u);
     return uint(round(clamp(value, 0.0, 1.0) * max_val));
+}
+
+uint quantize_with_dither(float value, uint bits, uint pixel_idx) {
+    if (bits == 0) return 0;
+    float max_val = float((1u << bits) - 1u);
+    
+    float dither_amount = 0.0;
+    if (g_use_dithering > 0) {
+        dither_amount = (DITHER_MATRIX[pixel_idx & 15] - 0.5) / max_val;
+    }
+    
+    return uint(round(clamp(value + dither_amount, 0.0, 1.0) * max_val));
 }
 
 float dequantize_from_index(uint index, uint bits) {
     if (bits == 0) return 0.0;
-    float max_val = float((1 << bits) - 1);
+    float max_val = float((1u << bits) - 1u);
     return float(index) / max_val;
 }
 
@@ -68,11 +93,11 @@ void set_bits(inout uvec4 block, uint value, uint offset, uint num_bits)
         return;
     }
 
-    uint mask = (num_bits == 32) ? 0xFFFFFFFF : (1 << num_bits) - 1;
+    uint mask = (num_bits == 32) ? 0xFFFFFFFFu : ((1u << num_bits) - 1u);
     uint val_masked = (value & mask);
 
-    uint dword_index = offset / 32;
-    uint bit_in_dword = offset % 32;
+    uint dword_index = offset >> 5;  // Optimized division by 32
+    uint bit_in_dword = offset & 31; // Optimized modulo 32
 
     block[dword_index] |= (val_masked << bit_in_dword);
 
@@ -90,17 +115,17 @@ uint get_bits(uvec4 block, uint offset, uint num_bits)
         return 0;
     }
 
-    uint mask = (num_bits == 32) ? 0xFFFFFFFF : (1 << num_bits) - 1;
+    uint mask = (num_bits == 32) ? 0xFFFFFFFFu : ((1u << num_bits) - 1u);
 
-    uint dword_index = offset / 32;
-    uint bit_in_dword = offset % 32;
+    uint dword_index = offset >> 5;
+    uint bit_in_dword = offset & 31;
 
     uint value = (block[dword_index] >> bit_in_dword);
     uint bits_in_first_dword = 32 - bit_in_dword;
     if (bits_in_first_dword < num_bits)
     {
         uint bits_from_next_dword = num_bits - bits_in_first_dword;
-        uint next_dword_mask = (1 << bits_from_next_dword) - 1;
+        uint next_dword_mask = (1u << bits_from_next_dword) - 1u;
         uint overflow_bits = (block[dword_index + 1] & next_dword_mask);
 
         // Combine them
@@ -123,14 +148,14 @@ uvec4 pack_astc_block_rgba_5_4(vec4 q_Ea, vec4 q_Eb, uint weight_base_index)
     offset = 17;
 
     uint c_indices[8];
-    c_indices[0] = quantize_to_index(q_Ea.r, 5);
-    c_indices[1] = quantize_to_index(q_Ea.g, 5);
-    c_indices[2] = quantize_to_index(q_Ea.b, 5);
-    c_indices[3] = quantize_to_index(q_Ea.a, 5);
-    c_indices[4] = quantize_to_index(q_Eb.r, 5);
-    c_indices[5] = quantize_to_index(q_Eb.g, 5);
-    c_indices[6] = quantize_to_index(q_Eb.b, 5);
-    c_indices[7] = quantize_to_index(q_Eb.a, 5);
+    c_indices[0] = quantize_with_dither(clamp(q_Ea.r, 0.0, 1.0), 5, 0);
+    c_indices[1] = quantize_with_dither(clamp(q_Ea.g, 0.0, 1.0), 5, 1);
+    c_indices[2] = quantize_with_dither(clamp(q_Ea.b, 0.0, 1.0), 5, 2);
+    c_indices[3] = quantize_with_dither(clamp(q_Ea.a, 0.0, 1.0), 5, 3);
+    c_indices[4] = quantize_with_dither(clamp(q_Eb.r, 0.0, 1.0), 5, 4);
+    c_indices[5] = quantize_with_dither(clamp(q_Eb.g, 0.0, 1.0), 5, 5);
+    c_indices[6] = quantize_with_dither(clamp(q_Eb.b, 0.0, 1.0), 5, 6);
+    c_indices[7] = quantize_with_dither(clamp(q_Eb.a, 0.0, 1.0), 5, 7);
 
     for (uint i = 0; i < 8; i++) {
         set_bits(block, c_indices[i], offset, 5);
@@ -159,12 +184,12 @@ uvec4 pack_astc_block_rgb_5_5(vec3 q_Ea_rgb, vec3 q_Eb_rgb, uint weight_base_ind
     offset = 17;
 
     uint c_indices[6];
-    c_indices[0] = quantize_to_index(q_Ea_rgb.r, 5);
-    c_indices[1] = quantize_to_index(q_Ea_rgb.g, 5);
-    c_indices[2] = quantize_to_index(q_Ea_rgb.b, 5);
-    c_indices[3] = quantize_to_index(q_Eb_rgb.r, 5);
-    c_indices[4] = quantize_to_index(q_Eb_rgb.g, 5);
-    c_indices[5] = quantize_to_index(q_Eb_rgb.b, 5);
+    c_indices[0] = quantize_with_dither(clamp(q_Ea_rgb.r, 0.0, 1.0), 5, 0);
+    c_indices[1] = quantize_with_dither(clamp(q_Ea_rgb.g, 0.0, 1.0), 5, 1);
+    c_indices[2] = quantize_with_dither(clamp(q_Ea_rgb.b, 0.0, 1.0), 5, 2);
+    c_indices[3] = quantize_with_dither(clamp(q_Eb_rgb.r, 0.0, 1.0), 5, 3);
+    c_indices[4] = quantize_with_dither(clamp(q_Eb_rgb.g, 0.0, 1.0), 5, 4);
+    c_indices[5] = quantize_with_dither(clamp(q_Eb_rgb.b, 0.0, 1.0), 5, 5);
 
     for (uint i = 0; i < 6; i++) {
         set_bits(block, c_indices[i], offset, 5);
@@ -179,6 +204,67 @@ uvec4 pack_astc_block_rgb_5_5(vec3 q_Ea_rgb, vec3 q_Eb_rgb, uint weight_base_ind
     }
 
     return block;
+}
+
+void compute_pca_endpoints(uint block_idx, uint pixel_idx, uint lane_id) {
+    // Compute mean
+    s_reduce_min[lane_id] = s_block_pixels[lane_id];
+    barrier(); memoryBarrierShared();
+    
+    for (uint s = 8; s > 0; s >>= 1) {
+        if (pixel_idx < s) {
+            s_reduce_min[lane_id] += s_reduce_min[lane_id + s];
+        }
+        barrier(); memoryBarrierShared();
+    }
+    
+    if (pixel_idx == 0) {
+        s_mean[block_idx] = s_reduce_min[lane_id] / 16.0;
+    }
+    barrier(); memoryBarrierShared();
+    
+    // Compute variance
+    vec4 centered = s_block_pixels[lane_id] - s_mean[block_idx];
+    s_reduce_max[lane_id] = centered * centered;
+    barrier(); memoryBarrierShared();
+    
+    for (uint s = 8; s > 0; s >>= 1) {
+        if (pixel_idx < s) {
+            s_reduce_max[lane_id] += s_reduce_max[lane_id + s];
+        }
+        barrier(); memoryBarrierShared();
+    }
+    
+    vec4 variance = (pixel_idx == 0) ? s_reduce_max[lane_id] : vec4(0);
+    
+    // Simple PCA: use variance as axis direction
+    vec4 axis = normalize(variance + vec4(1e-6));
+    
+    // Project pixels onto axis
+    s_projections[lane_id] = dot(centered, axis);
+    barrier(); memoryBarrierShared();
+    
+    // Find min/max projections
+    float proj = s_projections[lane_id];
+    s_reduce_min[lane_id] = vec4(proj);
+    s_reduce_max[lane_id] = vec4(proj);
+    barrier(); memoryBarrierShared();
+    
+    for (uint s = 8; s > 0; s >>= 1) {
+        if (pixel_idx < s) {
+            s_reduce_min[lane_id].x = min(s_reduce_min[lane_id].x, s_reduce_min[lane_id + s].x);
+            s_reduce_max[lane_id].x = max(s_reduce_max[lane_id].x, s_reduce_max[lane_id + s].x);
+        }
+        barrier(); memoryBarrierShared();
+    }
+    
+    if (pixel_idx == 0) {
+        float min_proj = s_reduce_min[lane_id].x;
+        float max_proj = s_reduce_max[lane_id].x;
+        
+        s_Ea[block_idx] = clamp(s_mean[block_idx] + axis * min_proj, vec4(0.0), vec4(1.0));
+        s_Eb[block_idx] = clamp(s_mean[block_idx] + axis * max_proj, vec4(0.0), vec4(1.0));
+    }
 }
 
 void main() {
@@ -209,29 +295,34 @@ void main() {
     barrier(); memoryBarrierShared();
 
 
-    // Endpoint Selection (AABB)
-    s_reduce_min[lane_id] = s_block_pixels[lane_id];
-    s_reduce_max[lane_id] = s_block_pixels[lane_id];
-    barrier(); memoryBarrierShared();
-
-    for (uint s = 8; s > 0; s >>= 1) {
-        if (pixel_idx < s) {
-            s_reduce_min[lane_id] = min(s_reduce_min[lane_id], s_reduce_min[lane_id + s]);
-            s_reduce_max[lane_id] = max(s_reduce_max[lane_id], s_reduce_max[lane_id + s]);
-        }
+    // Endpoint Selection (AABB or PCA)
+    if (g_use_pca > 0) {
+        compute_pca_endpoints(block_idx, pixel_idx, lane_id);
+    } else {
+        // Original AABB method
+        s_reduce_min[lane_id] = s_block_pixels[lane_id];
+        s_reduce_max[lane_id] = s_block_pixels[lane_id];
         barrier(); memoryBarrierShared();
-    }
 
-    if (pixel_idx == 0) {
-        s_Ea[block_idx] = s_reduce_min[lane_id];
-        s_Eb[block_idx] = s_reduce_max[lane_id];
+        for (uint s = 8; s > 0; s >>= 1) {
+            if (pixel_idx < s) {
+                s_reduce_min[lane_id] = min(s_reduce_min[lane_id], s_reduce_min[lane_id + s]);
+                s_reduce_max[lane_id] = max(s_reduce_max[lane_id], s_reduce_max[lane_id + s]);
+            }
+            barrier(); memoryBarrierShared();
+        }
+
+        if (pixel_idx == 0) {
+            s_Ea[block_idx] = s_reduce_min[lane_id];
+            s_Eb[block_idx] = s_reduce_max[lane_id];
+        }
     }
     barrier(); memoryBarrierShared();
 
 
     // Weight calculation via projection onto Eb-Ea
     vec4 E_delta = s_Eb[block_idx] - s_Ea[block_idx];
-    float dot_delta = dot(E_delta, E_delta) + 1e-9f;
+    float dot_delta = max(dot(E_delta, E_delta), 1e-6f);
     vec4 P = s_block_pixels[lane_id];
     float proj = dot(P - s_Ea[block_idx], E_delta) / dot_delta;
     s_ideal_weights[lane_id] = clamp(proj, 0.0, 1.0);
@@ -240,11 +331,11 @@ void main() {
     // Quantization
     bool transparent = s_is_transparent[block_idx];
     uint weight_bits = transparent ? WEIGHT_BITS_TRANS : WEIGHT_BITS_OPAQUE;
-    uint final_q_weight_idx = quantize_to_index(s_ideal_weights[lane_id], weight_bits);
+    uint final_q_weight_idx = quantize_with_dither(s_ideal_weights[lane_id], weight_bits, pixel_idx);
     s_final_q_weights[lane_id] = final_q_weight_idx;
     barrier(); memoryBarrierShared();
 
-    // ASTC Packing (TODO)
+    // ASTC Packing
     if (pixel_idx == 0) {
         bool is_final_transparent = s_is_transparent[block_idx];
         vec4 q_Ea = s_Ea[block_idx];
@@ -271,6 +362,7 @@ void main() {
 
     vec4 decoded_Ea, decoded_Eb;
     uint decoded_weight_idx;
+    uint weight_bits_decode = is_decode_transparent ? WEIGHT_BITS_TRANS : WEIGHT_BITS_OPAQUE;
 
     if (is_decode_transparent) {
         // Decode RGBA block
@@ -303,7 +395,7 @@ void main() {
         decoded_weight_idx = get_bits(my_packed_block, weight_offset, 5);
     }
 
-    float w = dequantize_from_index(decoded_weight_idx, weight_bits);
+    float w = dequantize_from_index(decoded_weight_idx, weight_bits_decode);
 
     // LERP the final color
     vec4 final_color = mix(decoded_Ea, decoded_Eb, w);
