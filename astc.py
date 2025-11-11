@@ -9,6 +9,10 @@ from PIL import Image
 
 
 def prepare_input_data(filename="input.png"):
+    if not os.path.exists(filename):
+        print(f"Error: Input file '{filename}' not found")
+        return None, 0, 0, 0
+        
     with Image.open(filename) as img:
         original_width, original_height = img.size
 
@@ -30,20 +34,26 @@ def prepare_input_data(filename="input.png"):
         return tiled_data, total_blocks, original_width, original_height
 
 
-async def run_astc_compute(input_data, total_blocks):
+async def run_astc_compute(input_data, total_blocks, use_pca=False, use_dithering=False):
     """
     The main WGPU function, now returning both compressed and decoded data.
     """
+    if not os.path.exists("astc_compress.spv"):
+        raise FileNotFoundError("Required shader file 'astc_compress.spv' not found. "
+                              "Compile with: glslangValidator -V astc_compress.glsl -o astc_compress.spv")
+    
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
     if adapter is None:
         raise RuntimeError("Could not get a WGPU adapter.")
 
     features = adapter.features
-    if "timestamp-query" not in features:
-        raise RuntimeError("Timestamp queries not supported on this adapter. Cannot perform precise timing.")
-    device = adapter.request_device_sync(required_features=["timestamp-query"])
+    required_features = []
+    if "timestamp-query" in features:
+        required_features.append("timestamp-query")
+    device = adapter.request_device_sync(required_features=required_features)
 
     print(f"Got device: {adapter.summary}")
+    print(f"Using PCA: {use_pca}, Using Dithering: {use_dithering}")
 
     with open("astc_compress.spv", "rb") as f:
         shader_code = f.read()
@@ -52,7 +62,7 @@ async def run_astc_compute(input_data, total_blocks):
     NUM_WORKGROUPS = (total_blocks + 3) // 4
     total_blocks_padded_for_shader = NUM_WORKGROUPS * 4
 
-    cparams_data = np.array([total_blocks], dtype=np.uint32)
+    cparams_data = np.array([total_blocks, int(use_pca), int(use_dithering)], dtype=np.uint32)
     b0_uniform = device.create_buffer_with_data(data=cparams_data, usage=wgpu.BufferUsage.UNIFORM)
     input_pixel_buffer_size = input_data.nbytes
     b1_storage_in = device.create_buffer_with_data(data=input_data, usage=wgpu.BufferUsage.STORAGE)
@@ -157,19 +167,28 @@ def save_decoded_image(filename, flat_pixel_data, original_width, original_heigh
     cropped_image = padded_image[:original_height, :original_width, :]
     image_uint8 = (np.clip(cropped_image, 0.0, 1.0) * 255).astype(np.uint8)
     Image.fromarray(image_uint8, 'RGBA').save(filename)
+    print(f"Successfully saved decoded image to '{filename}'")
 
 
 def main():
-    input_filename = "screenshot.jpg"
-    astc_output_filename = "output.astc"
-    png_output_filename = "decoded_screenshot.png"
-    tiled_data, total_blocks, width, height = prepare_input_data(input_filename)
+    import argparse
+    parser = argparse.ArgumentParser(description='ASTC GPU Compressor')
+    parser.add_argument('--input', default='screenshot.jpg', help='Input image file')
+    parser.add_argument('--output', default='output.astc', help='Output ASTC file')
+    parser.add_argument('--decoded', default='decoded_screenshot.png', help='Decoded PNG output')
+    parser.add_argument('--pca', action='store_true', help='Use PCA for better quality')
+    parser.add_argument('--dither', action='store_true', help='Enable dithering')
+    args = parser.parse_args()
+    
+    tiled_data, total_blocks, width, height = prepare_input_data(args.input)
     if tiled_data is None:
         return
 
-    compressed_results, decoded_pixels = asyncio.run(run_astc_compute(tiled_data, total_blocks))
-    save_astc_file(astc_output_filename, compressed_results, width, height)
-    save_decoded_image(png_output_filename, decoded_pixels, width, height)
+    compressed_results, decoded_pixels = asyncio.run(
+        run_astc_compute(tiled_data, total_blocks, args.pca, args.dither)
+    )
+    save_astc_file(args.output, compressed_results, width, height)
+    save_decoded_image(args.decoded, decoded_pixels, width, height)
 
 
 if __name__ == "__main__":
