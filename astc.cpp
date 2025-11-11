@@ -173,6 +173,9 @@ private:
     VkQueue queue;
     uint32_t queueFamilyIndex;
 
+    VkQueryPool queryPool;
+    float timestampPeriod;
+
     ImageData imageData;
     uint32_t numWorkGroups;
     VkDeviceSize compressedBufferSize, decodedBufferSize;
@@ -190,6 +193,7 @@ public:
         createInstance();
         findPhysicalDevice();
         createDevice();
+        createQueryPool();
         createCommandPool(); // Command pool must exist before we can use it for copies
         createBuffers();
         createDescriptorSetLayout();
@@ -243,6 +247,10 @@ public:
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(physicalDevice, &props);
         std::cout << "Using device: " << props.deviceName << std::endl;
+
+        // Get the timestamp period for converting timestamps to nanoseconds.
+        timestampPeriod = props.limits.timestampPeriod;
+        std::cout << "Device timestamp period: " << timestampPeriod << " ns" << std::endl;
     }
     
     uint32_t getComputeQueueFamilyIndex() {
@@ -273,6 +281,7 @@ public:
         VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR subgroupControlFlowFeatures = {};
         subgroupControlFlowFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
         subgroupControlFlowFeatures.shaderSubgroupUniformControlFlow = VK_TRUE;
+        subgroupControlFlowFeatures.pNext = nullptr; // Chain starts here
 
         VkPhysicalDeviceFeatures2 deviceFeatures2 = {};
         deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -286,6 +295,9 @@ public:
         const std::vector<const char*> deviceExtensions = {
             VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME
         };
+
+        // deviceFeatures2.features.shaderSubgroupUniformControlFlow = VK_TRUE; // This should be set in the features struct itself if available and needed.
+        // deviceFeatures2.features.timestampComputeAndGraphics = VK_TRUE; // This is the key change!
         
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -531,10 +543,18 @@ public:
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK_RESULT(vkBeginCommandBuffer(commandBuffer, &beginInfo));
+
+        vkCmdResetQueryPool(commandBuffer, queryPool, 0, 2);
+
+        // Start timestamp
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0);
         
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
         vkCmdDispatch(commandBuffer, numWorkGroups, 1, 1);
+
+        // End timestamp
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 1);
         
         VkMemoryBarrier memoryBarrier = {};
         memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -544,13 +564,18 @@ public:
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 
             VK_PIPELINE_STAGE_TRANSFER_BIT, 
             0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 2);
 
         VkBufferCopy copyRegion = {};
         copyRegion.size = compressedBufferSize;
         vkCmdCopyBuffer(commandBuffer, compressedBuffer, readbackCompressedBuffer, 1, &copyRegion);
+
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 3);
         
         copyRegion.size = decodedBufferSize;
         vkCmdCopyBuffer(commandBuffer, decodedBuffer, readbackDecodedBuffer, 1, &copyRegion);
+
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 4);
 
         VK_CHECK_RESULT(vkEndCommandBuffer(commandBuffer));
     }
@@ -565,9 +590,37 @@ public:
         VkFenceCreateInfo fenceInfo = {};
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         VK_CHECK_RESULT(vkCreateFence(device, &fenceInfo, nullptr, &fence));
-        
+        std::cout << "Submitting..." << std::endl;
         VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, fence));
         VK_CHECK_RESULT(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+        std::cout << "Completed..." << std::endl;
+
+        // The GPU has finished, so we can get the query results.
+        uint64_t timestamps[5];
+        VK_CHECK_RESULT(vkGetQueryPoolResults(
+            device,
+            queryPool,
+            0, // first query
+            5, // query count
+            sizeof(timestamps),
+            &timestamps,
+            sizeof(uint64_t), // stride
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+
+        uint64_t startTime = timestamps[0];
+        uint64_t endTime = timestamps[1];
+        uint64_t duration_ticks = endTime - startTime;
+        double duration_ns = duration_ticks * timestampPeriod;
+        double duration_ms = duration_ns * 1e-6;
+        #define TIME(n) ((timestamps[n] - timestamps[0]) * timestampPeriod * 1e-6)
+
+        std::cout << "----------------------------------------" << std::endl;
+        std::cout << "GPU to dispatch time: " << TIME(1) << " ms" << std::endl;
+        std::cout << "GPU to barrier time: " << TIME(2) << " ms" << std::endl;
+        std::cout << "GPU to copy buffer 1 time: " << TIME(3) << " ms" << std::endl;
+        std::cout << "GPU to copy buffer 2 time: " << TIME(4) << " ms" << std::endl;
+        std::cout << "----------------------------------------" << std::endl;
+
         std::cout << "GPU execution finished." << std::endl;
 
         vkDestroyFence(device, fence, nullptr);
@@ -590,6 +643,14 @@ public:
         memcpy(decodedResult.data(), mappedMemory, decodedBufferSize);
         vkUnmapMemory(device, readbackDecodedMemory);
         save_decoded_image("decoded_screenshot.png", decodedResult, imageData.originalWidth, imageData.originalHeight);
+    }
+
+    void createQueryPool() {
+        VkQueryPoolCreateInfo queryPoolInfo = {};
+        queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryPoolInfo.queryCount = 2; // One for start, one for end
+        VK_CHECK_RESULT(vkCreateQueryPool(device, &queryPoolInfo, nullptr, &queryPool));
     }
 
     void cleanup() {
