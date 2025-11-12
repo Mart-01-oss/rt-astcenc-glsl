@@ -810,7 +810,7 @@ public:
 int main() {
     ASTCComputeApp app;
     try {
-        app.run("screenshot.jpg");
+        app.run("pixelzombie.jpg");
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;
