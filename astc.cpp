@@ -187,10 +187,12 @@ private:
     ImageData imageData;
     uint32_t numWorkGroups;
     VkDeviceSize compressedBufferSize, decodedBufferSize;
+    std::string input_file;
 
 public:
-    void run() {
-        imageData = prepare_input_data("screenshot.jpg");
+    void run(const char* filename = "screenshot.jpg") {
+        input_file = filename;
+        imageData = prepare_input_data(filename);
         if (imageData.tiledData.empty()) return;
 
         numWorkGroups = (imageData.totalBlocks + 3) / 4;
@@ -390,7 +392,7 @@ public:
         vkMapMemory(device, stagingBufferMemory, 0, uniformBufferSize, 0, &data);
         memcpy(data, &imageData.totalBlocks, sizeof(uint32_t));
         (static_cast<uint32_t*>(data))[1] = 1; // Use PCA
-        (static_cast<float*>(data))[2] = 2.5f; // Use 2-partition mode if the width of the point cloud is > 33% of the length
+        (static_cast<float*>(data))[2] = 0.1f; // Use 2-partition mode if the width of the point cloud is > 33% of the length
         vkUnmapMemory(device, stagingBufferMemory);
         copyBuffer(stagingBuffer, uniformBuffer, uniformBufferSize);
         vkDestroyBuffer(device, stagingBuffer, nullptr);
@@ -762,7 +764,8 @@ public:
         std::vector<float> decodedResult(decodedBufferSize / sizeof(float));
         memcpy(decodedResult.data(), mappedMemory, decodedBufferSize);
         vkUnmapMemory(device, readbackDecodedMemory);
-        save_decoded_image("decoded_screenshot.png", decodedResult, imageData.originalWidth, imageData.originalHeight);
+        auto output_file = std::string("decoded_") + input_file;
+        save_decoded_image(output_file.c_str(), decodedResult, imageData.originalWidth, imageData.originalHeight);
     }
 
     void createQueryPool() {
@@ -807,7 +810,7 @@ public:
 int main() {
     ASTCComputeApp app;
     try {
-        app.run();
+        app.run("screenshot.jpg");
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;

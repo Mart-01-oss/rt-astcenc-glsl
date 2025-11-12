@@ -4,13 +4,10 @@
 
 layout(local_size_x = 16, local_size_y = 4, local_size_z = 1) in;
 
-const uint WEIGHT_BITS_OPAQUE = 5; // RANGE_32
-const uint WEIGHT_BITS_TRANS  = 4; // RANGE_16
-
 layout(std140, binding = 0) uniform CParams {
     uint g_num_total_blocks;
     uint g_use_pca;
-    float g_use_secondary_direction_ratio;
+    float g_maximum_PC2_spread;
 };
 
 // Input: Uncompressed pixels (B, 16, 4)
@@ -196,9 +193,11 @@ void pack_astc_block_parallel_2p_rgba(uint block_idx, uint weight_base_index, ui
     // Pack Endpoints: 2 partitions * 2 endpoints * 4 channels = 16 channels
     // 16 channels * 3 bits/channel = 48 bits. Starts at bit 27.
     // All 16 threads pack one channel each.
-    uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-    uint c_offset = 27 + pixel_idx * 3; // 3 bits per channel
-    set_bits_atomic_shared(block_idx, c_index, c_offset, 3);
+    if (pixel_idx < 16) {
+        uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
+        uint c_offset = 27 + pixel_idx * 3; // 3 bits per channel
+        set_bits_atomic_shared(block_idx, c_index, c_offset, 3);
+    }
     
     // Pack Weights: 16 pixels * 3 bits/weight = 48 bits
     // Starts at bit (128 - 48) = 80
@@ -263,7 +262,7 @@ vec4 YCoCg_to_RGB(vec4 ycocg) {
     return vec4(R, G, B, ycocg.w);
 }
 
-const vec4 kYCoCgScale = vec4(1.5, 1.0, 1.0, 1.0);
+const vec4 kYCoCgScale = vec4(1.0, 1.0, 1.0, 1.0);
 
 void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out vec4 Ec, out vec4 Ed, out bool needs_2p) {
     // We will do 2 rounds of PCA within the luma space, prioritizing Y (luma) specifically
@@ -299,7 +298,7 @@ void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out v
     Ea = YCoCg_to_RGB(p1_YCoCg);
     Eb = YCoCg_to_RGB(p2_YCoCg);
 
-    if (g_use_secondary_direction_ratio >= 10.0) return; // don't use 2p mode, uniform dataflow
+    if (g_maximum_PC2_spread >= 2) return; // don't use 2p mode, uniform dataflow
 
     // secondary PCA direction (dir2)
     vec4 dir2 = normalize(vec4(0.0, 1.0, 0.0, 0.0));
@@ -325,12 +324,10 @@ void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out v
     Ec = YCoCg_to_RGB(p3_YCoCg);
     Ed = YCoCg_to_RGB(p4_YCoCg);
 
-    // The "length" of the primary direction and the "width" of the secondary direction
+    // The "width" of the secondary direction
     // We'll use this to heuristically evaluate if we need to do 2 partitions
-    float spread_PC1 = maxProj1 - minProj1;
-    float spread_PC2 = maxProj2 - minProj2;
-
-    needs_2p = (spread_PC2 / spread_PC1) >= g_use_secondary_direction_ratio;
+    float spread_PC2 = dot(Ed - Ec, Ed - Ec);
+    needs_2p = abs(spread_PC2) >= g_maximum_PC2_spread * g_maximum_PC2_spread;
 }
 
 vec4 get_scaled_ycocg(vec4 rgb) {
@@ -356,17 +353,16 @@ float get_dist_sq(vec4 p, vec4 Ea, vec4 Eb) {
 }
 
 // Returns 0 if a pixel belongs to (Ea,Eb), 1 if it belongs to (Ec,Ed)
-// Note the partitioning is also done within the scaled ycocg space
 int partition_pixel_subset(vec4 pixel_rgb, vec4 Ea_rgb, vec4 Eb_rgb, vec4 Ec_rgb, vec4 Ed_rgb) 
 {
-    vec4 p_scaled = get_scaled_ycocg(pixel_rgb);
-    vec4 a_scaled = get_scaled_ycocg(Ea_rgb);
-    vec4 b_scaled = get_scaled_ycocg(Eb_rgb);
-    vec4 c_scaled = get_scaled_ycocg(Ec_rgb);
-    vec4 d_scaled = get_scaled_ycocg(Ed_rgb);
+    // vec4 p_scaled = get_scaled_ycocg(pixel_rgb);
+    // vec4 a_scaled = get_scaled_ycocg(Ea_rgb);
+    // vec4 b_scaled = get_scaled_ycocg(Eb_rgb);
+    // vec4 c_scaled = get_scaled_ycocg(Ec_rgb);
+    // vec4 d_scaled = get_scaled_ycocg(Ed_rgb);
 
-    float dist1_sq = get_dist_sq(p_scaled, a_scaled, b_scaled);
-    float dist2_sq = get_dist_sq(p_scaled, c_scaled, d_scaled);
+    float dist1_sq = get_dist_sq(pixel_rgb, Ea_rgb, Eb_rgb);
+    float dist2_sq = get_dist_sq(pixel_rgb, Ec_rgb, Ed_rgb);
 
     // Return the index of the closer color spectrum/line
     return (dist2_sq < dist1_sq) ? 1 : 0;
@@ -443,8 +439,10 @@ void main() {
         uint color_bits = needs_2p ? (is_transparent ? 3 : 4) : 5;
         SET_EP(Ea);
         SET_EP(Eb);
-        SET_EP(Ec);
-        SET_EP(Ed);
+        if (needs_2p) {
+            SET_EP(Ec);
+            SET_EP(Ed);
+        }
         #undef SET_EP
         #undef SET_EP_COMPONENT
     }
@@ -556,7 +554,7 @@ void main() {
     // LERP the final color
     vec4 final_color = mix(decoded_Ea, decoded_Eb, w);
     // if (needs_2p) {
-    //     // final_color = mix(final_color, vec4(1.0, 0.0, 1.0, 1.0), 0.5);
+    //     final_color = mix(final_color, vec4(1.0, 0.0, 1.0, 1.0), 0.5);
     //     // final_color = vec4(1.0, 0.0, 1.0, 1.0);
     // }
     g_out_decoded_pixels[global_block_id * 16 + pixel_idx] = final_color;
