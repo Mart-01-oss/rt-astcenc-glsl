@@ -170,6 +170,14 @@ private:
     VkBuffer readbackDecodedBuffer;
     VkDeviceMemory readbackDecodedMemory;
 
+    // For the astc 2-partition decoding
+    VkBuffer lut1Buffer;
+    VkDeviceMemory lut1BufferMemory;
+    VkBufferView lut1BufferView;
+    VkBuffer lut2Buffer;
+    VkDeviceMemory lut2BufferMemory;
+    VkBufferView lut2BufferView;
+
     VkQueue queue;
     uint32_t queueFamilyIndex;
 
@@ -196,6 +204,7 @@ public:
         createQueryPool();
         createCommandPool(); // Command pool must exist before we can use it for copies
         createBuffers();
+        createBufferViews();
         createDescriptorSetLayout();
         createDescriptorPool();
         createDescriptorSet();
@@ -210,6 +219,19 @@ public:
         std::ifstream file(filename, std::ios::ate | std::ios::binary);
         if (!file.is_open()) {
             throw std::runtime_error("failed to open file!");
+        }
+        size_t fileSize = (size_t)file.tellg();
+        std::vector<char> buffer(fileSize);
+        file.seekg(0);
+        file.read(buffer.data(), fileSize);
+        file.close();
+        return buffer;
+    }
+
+    static std::vector<char> loadBinaryFile(const std::string& filename) {
+        std::ifstream file(filename, std::ios::ate | std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("failed to open binary file!");
         }
         size_t fileSize = (size_t)file.tellg();
         std::vector<char> buffer(fileSize);
@@ -368,7 +390,7 @@ public:
         vkMapMemory(device, stagingBufferMemory, 0, uniformBufferSize, 0, &data);
         memcpy(data, &imageData.totalBlocks, sizeof(uint32_t));
         (static_cast<uint32_t*>(data))[1] = 1; // Use PCA
-        (static_cast<float*>(data))[2] = 0.33f; // Use 2-partition mode if the width of the point cloud is > 33% of the length
+        (static_cast<float*>(data))[2] = 2.5f; // Use 2-partition mode if the width of the point cloud is > 33% of the length
         vkUnmapMemory(device, stagingBufferMemory);
         copyBuffer(stagingBuffer, uniformBuffer, uniformBufferSize);
         vkDestroyBuffer(device, stagingBuffer, nullptr);
@@ -385,6 +407,48 @@ public:
 
         createBuffer(compressedBufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, readbackCompressedBuffer, readbackCompressedMemory);
         createBuffer(decodedBufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, readbackDecodedBuffer, readbackDecodedMemory);
+
+        // Load LUT 1 (ideal map -> seed)
+        std::cerr << "Loading LUT 1..." << std::endl;
+        auto lut1Data = loadBinaryFile("astc_2p_4x4_lut.bin");
+        VkDeviceSize lut1BufferSize = lut1Data.size();
+        createBuffer(lut1BufferSize, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, lut1Buffer, lut1BufferMemory);
+
+        createBuffer(lut1BufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+        vkMapMemory(device, stagingBufferMemory, 0, lut1BufferSize, 0, &data);
+        memcpy(data, lut1Data.data(), (size_t)lut1BufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+        copyBuffer(stagingBuffer, lut1Buffer, lut1BufferSize);
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+
+        // Load LUT 2 (seed -> mask)
+        std::cerr << "Loading LUT 2..." << std::endl;
+        auto lut2Data = loadBinaryFile("astc_2p_seed_to_mask_lut.bin");
+        VkDeviceSize lut2BufferSize = lut2Data.size();
+        createBuffer(lut2BufferSize, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, lut2Buffer, lut2BufferMemory);
+
+        createBuffer(lut2BufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+        vkMapMemory(device, stagingBufferMemory, 0, lut2BufferSize, 0, &data);
+        memcpy(data, lut2Data.data(), (size_t)lut2BufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+        copyBuffer(stagingBuffer, lut2Buffer, lut2BufferSize);
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    void createBufferViews() {
+        VkBufferViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+        viewInfo.buffer = lut1Buffer;
+        viewInfo.format = VK_FORMAT_R16_UINT; // This is the r16ui format
+        viewInfo.range = VK_WHOLE_SIZE;
+        VK_CHECK_RESULT(vkCreateBufferView(device, &viewInfo, nullptr, &lut1BufferView));
+
+        viewInfo.buffer = lut2Buffer;
+        viewInfo.format = VK_FORMAT_R16_UINT; // This is the r16ui format
+        viewInfo.range = VK_WHOLE_SIZE;
+        VK_CHECK_RESULT(vkCreateBufferView(device, &viewInfo, nullptr, &lut2BufferView));
     }
 
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
@@ -446,7 +510,7 @@ public:
     }
     
     void createDescriptorSetLayout() {
-        VkDescriptorSetLayoutBinding bindings[4] = {};
+        VkDescriptorSetLayoutBinding bindings[6] = {};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
@@ -467,9 +531,19 @@ public:
         bindings[3].descriptorCount = 1;
         bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+        bindings[4].binding = 4;
+        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        bindings[4].descriptorCount = 1;
+        bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        bindings[5].binding = 5;
+        bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        bindings[5].descriptorCount = 1;
+        bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
         VkDescriptorSetLayoutCreateInfo layoutInfo = {};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 4;
+        layoutInfo.bindingCount = 6;
         layoutInfo.pBindings = bindings;
         VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout));
     }
@@ -480,10 +554,12 @@ public:
         poolSizes[0].descriptorCount = 1;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         poolSizes[1].descriptorCount = 3;
+        poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        poolSizes[2].descriptorCount = 2;
 
         VkDescriptorPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = 2;
+        poolInfo.poolSizeCount = 3;
         poolInfo.pPoolSizes = poolSizes;
         poolInfo.maxSets = 1;
         VK_CHECK_RESULT(vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool));
@@ -502,7 +578,7 @@ public:
         VkDescriptorBufferInfo compressedBufferInfo = {compressedBuffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo decodedBufferInfo = {decodedBuffer, 0, VK_WHOLE_SIZE};
 
-        VkWriteDescriptorSet descriptorWrites[4] = {};
+        VkWriteDescriptorSet descriptorWrites[6] = {};
         descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         descriptorWrites[0].dstSet = descriptorSet;
         descriptorWrites[0].dstBinding = 0;
@@ -531,7 +607,21 @@ public:
         descriptorWrites[3].descriptorCount = 1;
         descriptorWrites[3].pBufferInfo = &decodedBufferInfo;
 
-        vkUpdateDescriptorSets(device, 4, descriptorWrites, 0, nullptr);
+        descriptorWrites[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[4].dstSet = descriptorSet;
+        descriptorWrites[4].dstBinding = 4;
+        descriptorWrites[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        descriptorWrites[4].descriptorCount = 1;
+        descriptorWrites[4].pTexelBufferView = &lut1BufferView; // Use pTexelBufferView
+
+        descriptorWrites[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[5].dstSet = descriptorSet;
+        descriptorWrites[5].dstBinding = 5;
+        descriptorWrites[5].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        descriptorWrites[5].descriptorCount = 1;
+        descriptorWrites[5].pTexelBufferView = &lut2BufferView; // Use pTexelBufferView
+
+        vkUpdateDescriptorSets(device, 6, descriptorWrites, 0, nullptr);
     }
     
     void createComputePipeline() {
@@ -696,6 +786,12 @@ public:
         vkFreeMemory(device, readbackCompressedMemory, nullptr);
         vkDestroyBuffer(device, readbackDecodedBuffer, nullptr);
         vkFreeMemory(device, readbackDecodedMemory, nullptr);
+        vkDestroyBufferView(device, lut1BufferView, nullptr);
+        vkDestroyBuffer(device, lut1Buffer, nullptr);
+        vkFreeMemory(device, lut1BufferMemory, nullptr);
+        vkDestroyBufferView(device, lut2BufferView, nullptr);
+        vkDestroyBuffer(device, lut2Buffer, nullptr);
+        vkFreeMemory(device, lut2BufferMemory, nullptr);
 
         vkDestroyShaderModule(device, computeShaderModule, nullptr);
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
