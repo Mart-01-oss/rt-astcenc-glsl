@@ -392,7 +392,7 @@ public:
         vkMapMemory(device, stagingBufferMemory, 0, uniformBufferSize, 0, &data);
         memcpy(data, &imageData.totalBlocks, sizeof(uint32_t));
         (static_cast<uint32_t*>(data))[1] = 1; // Use PCA
-        (static_cast<float*>(data))[2] = 0.1f; // Use 2-partition mode if the width of the point cloud is > 33% of the length
+        (static_cast<float*>(data))[2] = 0.1f; // Use 2-partition mode if the width of the point cloud is ~0.1 color step or more away
         vkUnmapMemory(device, stagingBufferMemory);
         copyBuffer(stagingBuffer, uniformBuffer, uniformBufferSize);
         vkDestroyBuffer(device, stagingBuffer, nullptr);
@@ -810,7 +810,7 @@ public:
 int main() {
     ASTCComputeApp app;
     try {
-        app.run("pixelzombie.jpg");
+        app.run("screenshot.jpg");
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;

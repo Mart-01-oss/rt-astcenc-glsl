@@ -4,6 +4,40 @@
 
 layout(local_size_x = 16, local_size_y = 4, local_size_z = 1) in;
 
+#define COLOR_BITS_RGB_1P 7
+#define COLOR_BITS_RGBA_1P 7
+#define COLOR_BITS_RGB_2P 5
+#define COLOR_BITS_RGBA_2P 3
+
+#define WEIGHT_BITS_RGB_1P 4
+#define WEIGHT_BITS_RGBA_1P 3
+#define WEIGHT_BITS_RGB_2P 2
+#define WEIGHT_BITS_RGBA_2P 3
+
+/*
+ * LUT mapping quantization bits to its 3-bit color mode ID.
+ */
+const uint COLOR_QUANT_MODE_LUT[6] = uint[](
+    0x0,       // RANGE_8, 3b
+    0x2,       // RANGE_16, 4b
+    0x1,       // RANGE_32, 5b
+    0x3,       // RANGE_64, 6b
+    0x6,       // RANGE_128, 7b
+    0x7        // RANGE_256, 8b
+);
+
+/*
+ * LUT mapping quantization bits to its 4-bit weight mode ID.
+ */
+const uint WEIGHT_QUANT_MODE_LUT[6] = uint[](
+    0x3,       // RANGE_8, 3b
+    0x5,       // RANGE_16, 4b
+    0x7,       // RANGE_32, 5b
+    0xB,       // RANGE_64, 6b
+    0xD,       // RANGE_128, 7b
+    0xF        // RANGE_256, 8b
+);
+
 layout(std140, binding = 0) uniform CParams {
     uint g_num_total_blocks;
     uint g_use_pca;
@@ -108,6 +142,40 @@ void set_bits_atomic_shared(uint block_idx, uint value, uint offset, uint num_bi
     }
 }
 
+/**
+ * Encodes the 11-bit ASTC block mode header for a 4x4, 1-partition block.
+ * 
+ * Block Mode [10:0] structure for 4x4, 1-partition:
+ * [10:9] : 00   (Selects 1-plane, not dual-plane)
+ * [8:6]  : color_mode (3 bits, from get_color_quant_mode)
+ * [5:2]  : weight_mode (4 bits, from get_weight_quant_mode)
+ * [1:0]  : 00   (Selects 4x4 block size)
+ */
+uint block_mode_p1(uint color_bits, uint weight_bits) {
+    uint color_mode = COLOR_QUANT_MODE_LUT[color_bits - 3];
+    uint weight_mode = WEIGHT_QUANT_MODE_LUT[weight_bits - 3];
+    uint quant_mode_7bit = (color_mode << 4) | weight_mode;
+    return quant_mode_7bit << 2;
+}
+
+/**
+ * Encodes the 11-bit ASTC block mode header for a 4x4, 2-partition block.
+ * NOTE: The weight range (R_M) is IMPLIED by the color range for 2-partition
+ * blocks (e.g., R8-R32 color -> R8 weight, R64 color -> R6 weight).
+ *
+ * Block Mode [10:0] structure for 4x4, 2-partition:
+ * [10:9] : 00   (Selects 1-plane, not dual-plane)
+ * [8:6]  : 000  (Fixed for 2-partition)
+ * [5]    : 0    (Fixed for 2-partition)
+ * [4:2]  : color_mode (3 bits, from get_color_quant_mode)
+ * [1:0]  : 01   (Selects 4x4 block size, 2/3/4 partitions)
+ */
+uint block_mode_p2(uint color_bits) {
+    uint color_mode = COLOR_QUANT_MODE_LUT[color_bits - 3];
+    return (color_mode << 2) | 0x01;
+}
+
+
 void pack_astc_block_parallel_rgba(uint block_idx, uint weight_base_index)
 {
     uint pixel_idx = gl_LocalInvocationID.x;
@@ -115,7 +183,8 @@ void pack_astc_block_parallel_rgba(uint block_idx, uint weight_base_index)
 
     if (pixel_idx == 0) {
         s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
-        set_bits_atomic_shared(block_idx, 0x054, 0, 11); // [00..10] 4x4, color_q=RANGE_32, weight_q=RANGE_16
+        // [00..10] 4x4, color_q=RANGE_32, weight_q=RANGE_16
+        set_bits_atomic_shared(block_idx, block_mode_p1(COLOR_BITS_RGBA_1P, WEIGHT_BITS_RGBA_1P), 0, 11);
         set_bits_atomic_shared(block_idx, 0x0, 11, 2);   // [11..12] partitions = 1
         set_bits_atomic_shared(block_idx, 0xD, 13, 4);   // [13..16] CEM = rgba_ldr
     }
@@ -125,16 +194,16 @@ void pack_astc_block_parallel_rgba(uint block_idx, uint weight_base_index)
     // [17..21], [22..26], ..x8.., [52..56] - color endpoint data (Ea.r, Ea.g, ..., Eb.b, Eb.a)
     if (pixel_idx < 8) {
         uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-        uint c_offset = 17 + pixel_idx * 5;
-        set_bits_atomic_shared(block_idx, c_index, c_offset, 5);
+        uint c_offset = 17 + pixel_idx * COLOR_BITS_RGBA_1P;
+        set_bits_atomic_shared(block_idx, c_index, c_offset, COLOR_BITS_RGBA_1P);
     }
 
     // All 16 threads pack their own weight.
     // [124..127], [120..123], ..16x.., [64..67]  - weight data (4 bits each)
     // thread_0  , thread_1  ,        , thread_15
     uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
-    uint w_offset = 128 - (pixel_idx + 1) * 4;
-    set_bits_atomic_shared(block_idx, w_idx, w_offset, 4);
+    uint w_offset = 128 - (pixel_idx + 1) * WEIGHT_BITS_RGBA_1P;
+    set_bits_atomic_shared(block_idx, w_idx, w_offset, WEIGHT_BITS_RGBA_1P);
 }
 
 void pack_astc_block_parallel_rgb(uint block_idx, uint weight_base_index)
@@ -144,7 +213,7 @@ void pack_astc_block_parallel_rgb(uint block_idx, uint weight_base_index)
 
     if (pixel_idx == 0) {
         s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
-        set_bits_atomic_shared(block_idx, 0x05C, 0, 11); // [00..10] 4x4, color_q=RANGE_32, weight_q=RANGE_32
+        set_bits_atomic_shared(block_idx, block_mode_p1(COLOR_BITS_RGB_1P, WEIGHT_BITS_RGB_1P), 0, 11); // [00..10] 4x4, color_q=RANGE_32, weight_q=RANGE_32
         set_bits_atomic_shared(block_idx, 0x0, 11, 2);   // [11..12] partitions = 1
         set_bits_atomic_shared(block_idx, 0x4, 13, 4);   // [13..16] CEM = rgb_ldr
     }
@@ -154,16 +223,16 @@ void pack_astc_block_parallel_rgb(uint block_idx, uint weight_base_index)
     // [17..21], [22..26], ..x6.., [42..46] - color endpoint data (Ea.r, Ea.g, ..., Eb.g, Eb.b)
     if (pixel_idx < 6) {
         uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-        uint c_offset = 17 + pixel_idx * 5;
-        set_bits_atomic_shared(block_idx, c_index, c_offset, 5);
+        uint c_offset = 17 + pixel_idx * COLOR_BITS_RGB_1P;
+        set_bits_atomic_shared(block_idx, c_index, c_offset, COLOR_BITS_RGB_1P);
     }
 
     // All 16 threads pack their own weight.
     // [123..127], [118..122], ..16x.., [48..52]  - weight data (5 bits each)
     // thread_0  , thread_1  ,        , thread_15
     uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
-    uint w_offset = 128 - (pixel_idx + 1) * 5;
-    set_bits_atomic_shared(block_idx, w_idx, w_offset, 5);
+    uint w_offset = 128 - (pixel_idx + 1) * WEIGHT_BITS_RGB_1P;
+    set_bits_atomic_shared(block_idx, w_idx, w_offset, WEIGHT_BITS_RGB_1P);
 }
 
 /**
@@ -180,7 +249,7 @@ void pack_astc_block_parallel_2p_rgba(uint block_idx, uint weight_base_index, ui
     if (pixel_idx == 0) {
         s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
         // [00..10] Block Mode: 4x4, 2-part, R8 color, R8 weight
-        set_bits_atomic_shared(block_idx, 0x010, 0, 11); 
+        set_bits_atomic_shared(block_idx, block_mode_p2(COLOR_BITS_RGBA_2P), 0, 11); 
         // [11..12] Partitions: 1 (for 2 partitions)
         set_bits_atomic_shared(block_idx, 0x1, 11, 2);   
         // [13..16] CEM: 0xD (rgba_ldr)
@@ -195,15 +264,15 @@ void pack_astc_block_parallel_2p_rgba(uint block_idx, uint weight_base_index, ui
     // All 16 threads pack one channel each.
     if (pixel_idx < 16) {
         uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-        uint c_offset = 27 + pixel_idx * 3; // 3 bits per channel
-        set_bits_atomic_shared(block_idx, c_index, c_offset, 3);
+        uint c_offset = 27 + pixel_idx * COLOR_BITS_RGBA_2P; // 3 bits per channel
+        set_bits_atomic_shared(block_idx, c_index, c_offset, COLOR_BITS_RGBA_2P);
     }
     
     // Pack Weights: 16 pixels * 3 bits/weight = 48 bits
     // Starts at bit (128 - 48) = 80
     uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
-    uint w_offset = 128 - (pixel_idx + 1) * 3; // 3 bits each
-    set_bits_atomic_shared(block_idx, w_idx, w_offset, 3);
+    uint w_offset = 128 - (pixel_idx + 1) * WEIGHT_BITS_RGBA_2P; // 3 bits each
+    set_bits_atomic_shared(block_idx, w_idx, w_offset, WEIGHT_BITS_RGBA_2P);
 }
 /**
  * Packs a 2-partition, 4x4 RGB block.
@@ -219,7 +288,7 @@ void pack_astc_block_parallel_2p_rgb(uint block_idx, uint weight_base_index, uin
     if (pixel_idx == 0) {
         s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
         // [00..10] Block Mode: 4x4, 2-part, R16 color, R8 weight
-        set_bits_atomic_shared(block_idx, 0x011, 0, 11); 
+        set_bits_atomic_shared(block_idx, block_mode_p2(COLOR_BITS_RGB_2P), 0, 11); 
         // [11..12] Partitions: 1 (for 2 partitions)
         set_bits_atomic_shared(block_idx, 0x1, 11, 2);   
         // [13..16] CEM: 0x4 (rgb_ldr)
@@ -234,69 +303,44 @@ void pack_astc_block_parallel_2p_rgb(uint block_idx, uint weight_base_index, uin
     // Threads 0-11 pack one channel each.
     if (pixel_idx < 12) {
         uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-        uint c_offset = 27 + pixel_idx * 4; // 4 bits per channel
-        set_bits_atomic_shared(block_idx, c_index, c_offset, 4);
+        uint c_offset = 27 + pixel_idx * COLOR_BITS_RGB_2P; // 4 bits per channel
+        set_bits_atomic_shared(block_idx, c_index, c_offset, COLOR_BITS_RGB_2P);
     }
     
     // Pack Weights: 16 pixels * 3 bits/weight = 48 bits
     // Starts at bit (128 - 48) = 80
     uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
-    uint w_offset = 128 - (pixel_idx + 1) * 3; // 3 bits each
-    set_bits_atomic_shared(block_idx, w_idx, w_offset, 3);
+    uint w_offset = 128 - (pixel_idx + 1) * WEIGHT_BITS_RGB_2P; // 3 bits each
+    set_bits_atomic_shared(block_idx, w_idx, w_offset, WEIGHT_BITS_RGB_2P);
 }
 
-vec4 RGB_to_YCoCg(vec4 rgb) {
-    float Y  =  0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b;
-    float Co =  0.5  * rgb.r               - 0.5  * rgb.b;
-    float Cg = -0.25 * rgb.r + 0.5 * rgb.g - 0.25 * rgb.b;
-    return vec4(Y, Co, Cg, rgb.a);
-}
-
-vec4 YCoCg_to_RGB(vec4 ycocg) {
-    float Y  = ycocg.x;
-    float Co = ycocg.y;
-    float Cg = ycocg.z;
-    float R = Y + Co - Cg;
-    float G = Y + Cg;
-    float B = Y - Co - Cg;
-    return vec4(R, G, B, ycocg.w);
-}
-
-const vec4 kYCoCgScale = vec4(1.0, 1.0, 1.0, 1.0);
-
-void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out vec4 Ec, out vec4 Ed, out bool needs_2p) {
+void pca_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out vec4 Ec, out vec4 Ed, out bool needs_2p) {
     // We will do 2 rounds of PCA within the luma space, prioritizing Y (luma) specifically
     // 1st round will find the principle direction
     // 2nd round will find the secondary direction orthogonal to the first
     // Note that the out endpoints (E1,Eb, Ec,Ed) will be uniform within a 4x4 block
-    vec4 pixel_ycocg = RGB_to_YCoCg(my_pixel);
 
-    vec4 sumPixels = subgroupClusteredAdd(pixel_ycocg, 16);
+    vec4 sumPixels = subgroupClusteredAdd(my_pixel, 16);
     vec4 mean = sumPixels / 16.0;
     
     // Center and Scale
-    vec4 centered = pixel_ycocg - mean;
-    vec4 scaledCentered = centered * kYCoCgScale;
+    vec4 centered = my_pixel - mean;
 
     // primary PCA direction (dir1)
     vec4 dir1 = normalize(vec4(1.0));
     // matrix-free power iteration
     for (int i = 0; i < 4; ++i) {
-        vec4 contribution = scaledCentered * dot(scaledCentered, dir1);
+        vec4 contribution = centered * dot(centered, dir1);
         vec4 newDir = subgroupClusteredAdd(contribution, 16);
         if (dot(newDir, newDir) > 1e-6) dir1 = normalize(newDir);
     }
 
-    float projection1 = dot(scaledCentered, dir1);
+    float projection1 = dot(centered, dir1);
     float minProj1 = subgroupClusteredMin(projection1, 16);
     float maxProj1 = subgroupClusteredMax(projection1, 16);
 
-    vec4 unscaledDir1 = dir1 / kYCoCgScale;
-    vec4 p1_YCoCg = mean + unscaledDir1 * minProj1;
-    vec4 p2_YCoCg = mean + unscaledDir1 * maxProj1;
-    
-    Ea = YCoCg_to_RGB(p1_YCoCg);
-    Eb = YCoCg_to_RGB(p2_YCoCg);
+    Ea = mean + dir1 * minProj1;
+    Eb = mean + dir1 * maxProj1;
 
     if (g_maximum_PC2_spread >= 2) return; // don't use 2p mode, uniform dataflow
 
@@ -306,23 +350,19 @@ void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out v
 
     // adapted power iteration with gram-schmid orthogonalization
     for (int i = 0; i < 4; ++i) {
-        vec4 contribution = scaledCentered * dot(scaledCentered, dir2);
+        vec4 contribution = centered * dot(centered, dir2);
         vec4 newDir = subgroupClusteredAdd(contribution, 16);
         // Gram-Schmidt: remove any dir1 component to ensure orthogonality
         newDir = newDir - dir1 * dot(newDir, dir1);
         if (dot(newDir, newDir) > 1e-6) dir2 = normalize(newDir);
     }
 
-    float projection2 = dot(scaledCentered, dir2);
+    float projection2 = dot(centered, dir2);
     float minProj2 = subgroupClusteredMin(projection2, 16);
     float maxProj2 = subgroupClusteredMax(projection2, 16);
 
-    vec4 unscaledDir2 = dir2 / kYCoCgScale;
-    vec4 p3_YCoCg = mean + unscaledDir2 * minProj2;
-    vec4 p4_YCoCg = mean + unscaledDir2 * maxProj2;
-
-    Ec = YCoCg_to_RGB(p3_YCoCg);
-    Ed = YCoCg_to_RGB(p4_YCoCg);
+    Ec = mean + dir2 * minProj2;
+    Ed = mean + dir2 * maxProj2;
 
     // The "width" of the secondary direction
     // We'll use this to heuristically evaluate if we need to do 2 partitions
@@ -330,13 +370,8 @@ void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out v
     needs_2p = abs(spread_PC2) >= g_maximum_PC2_spread * g_maximum_PC2_spread;
 }
 
-vec4 get_scaled_ycocg(vec4 rgb) {
-    return RGB_to_YCoCg(rgb) * kYCoCgScale;
-}
-
 // Calculate the squared dist of a point p to the line segment (Eb-Ea)
 // by projection p onto (Eb-Ea)
-// Note we can't reuse the projection here later because this is done in YCoCg
 float get_dist_sq(vec4 p, vec4 Ea, vec4 Eb) {
     vec4 E_delta = Eb - Ea;
     vec4 resid = p - Ea;
@@ -355,12 +390,6 @@ float get_dist_sq(vec4 p, vec4 Ea, vec4 Eb) {
 // Returns 0 if a pixel belongs to (Ea,Eb), 1 if it belongs to (Ec,Ed)
 int partition_pixel_subset(vec4 pixel_rgb, vec4 Ea_rgb, vec4 Eb_rgb, vec4 Ec_rgb, vec4 Ed_rgb) 
 {
-    // vec4 p_scaled = get_scaled_ycocg(pixel_rgb);
-    // vec4 a_scaled = get_scaled_ycocg(Ea_rgb);
-    // vec4 b_scaled = get_scaled_ycocg(Eb_rgb);
-    // vec4 c_scaled = get_scaled_ycocg(Ec_rgb);
-    // vec4 d_scaled = get_scaled_ycocg(Ed_rgb);
-
     float dist1_sq = get_dist_sq(pixel_rgb, Ea_rgb, Eb_rgb);
     float dist2_sq = get_dist_sq(pixel_rgb, Ec_rgb, Ed_rgb);
 
@@ -387,7 +416,8 @@ void main() {
     vec4 Ea, Eb, Ec, Ed;
     bool needs_2p = false;
     if (g_use_pca > 0) {
-        pca_ycocg_endpoint_selection(my_pixel, Ea, Eb, Ec, Ed, needs_2p);
+        pca_endpoint_selection(my_pixel, Ea, Eb, Ec, Ed, needs_2p);
+        // needs_2p = true; // DEBUG force 2p mode
     } else {
         // Use subgroup clustered AABB operations to compute the endpoints
         // never use 2 partitions here
@@ -399,24 +429,28 @@ void main() {
     vec4 E_delta = Eb - Ea;
     float dot_delta = dot(E_delta, E_delta) + 1e-9f;
     float proj1 = clamp(dot(my_pixel - Ea, E_delta) / dot_delta, 0.0, 1.0);
+    E_delta = Ed - Ec;
+    dot_delta = dot(E_delta, E_delta) + 1e-9f;
+    float proj2 = clamp(dot(my_pixel - Ec, E_delta) / dot_delta, 0.0, 1.0);
 
     // Ideal partition map calculation
     float proj = proj1;
     uint astc_seed = 6;
     uint my_final_partition = 0; // 0 for 1P, or 0/1 for 2P
+    uint ideal_partition_idx = 0;
+    uint ideal_map_int; // bitmask of where partion2 is
     if (needs_2p) { // This is an expensive O(100) divergence, but can't be optimized away
-        uint idx = partition_pixel_subset(my_pixel, Ea, Eb, Ec, Ed) == 0 ? pixel_idx : 0;
-        uint ideal_map_int = subgroupClusteredOr(1u << idx, 16);
+        ideal_partition_idx = partition_pixel_subset(my_pixel, Ea, Eb, Ec, Ed);
+        uint idx = ideal_partition_idx == 1 ? 1u << pixel_idx : 0;
+        ideal_map_int = subgroupClusteredOr(idx, 16);
 
         // We need to snap the ideal partition map to a valid astc partition index
         // TODO: look up ~ideal_map_int as well
         astc_seed = texelFetch(g_lut_ideal_to_seed, int(ideal_map_int)).r;
         uint final_partition_mask = texelFetch(g_lut_seed_to_mask, int(astc_seed)).r;
+        // TODO: check the L1/hamming distance to ideal mask, and unset needs_2p if > 2
         my_final_partition = (final_partition_mask >> pixel_idx) & 1u;
 
-        E_delta = Ed - Ec;
-        dot_delta = dot(E_delta, E_delta) + 1e-9f;
-        float proj2 = clamp(dot(my_pixel - Ec, E_delta) / dot_delta, 0.0, 1.0);
         proj = (my_final_partition == 0) ? proj1 : proj2;
     }
 
@@ -426,7 +460,8 @@ void main() {
     // is_transparent = true;
 
     // for partitions=2, weights are R8, otherwise, rgba is R16 while rgb is R32
-    uint weight_bits = needs_2p ? 3 : (is_transparent ? 4 : 5);
+    uint weight_bits = needs_2p ? (is_transparent ? WEIGHT_BITS_RGBA_2P : WEIGHT_BITS_RGB_2P) : (is_transparent ? WEIGHT_BITS_RGBA_1P : WEIGHT_BITS_RGB_1P);
+    uint color_bits = needs_2p ? (is_transparent ? COLOR_BITS_RGBA_2P : COLOR_BITS_RGB_2P) : (is_transparent ? COLOR_BITS_RGBA_1P : COLOR_BITS_RGB_1P);
     s_final_q_weights[lane_id] = quantize_to_index(proj, weight_bits);
 
     // Precompute the LUT for the quantied eps to avoid divergence
@@ -434,9 +469,7 @@ void main() {
         #define SET_EP_COMPONENT(x) { s_quantized_endpoints[offset] = quantize_to_index(x, color_bits); offset++; }
         #define SET_EP(x) SET_EP_COMPONENT(x.r); SET_EP_COMPONENT(x.g); SET_EP_COMPONENT(x.b); \
             if (is_transparent) SET_EP_COMPONENT(Ea.a)
-
         uint offset = block_idx * 16; // 16 entries per block
-        uint color_bits = needs_2p ? (is_transparent ? 3 : 4) : 5;
         SET_EP(Ea);
         SET_EP(Eb);
         if (needs_2p) {
@@ -477,10 +510,11 @@ void main() {
 
     uvec4 my_packed_block = s_packed_block[block_idx];
 
-    vec4 decoded_Ea, decoded_Eb;
+    vec4 decoded_Ea, decoded_Eb, decoded_Ec, decoded_Ed;;
     uint decoded_weight_idx;
     uint decode_offset;
-    uint decode_ep_bits;
+    uint decode_ep_bits = color_bits;
+    uint decoded_partition;
 
     #define DECODE_EP_COMPONENT() dequantize_from_index(get_bits(my_packed_block, decode_offset, decode_ep_bits), decode_ep_bits); decode_offset += decode_ep_bits
     #define DECODE_EP_RGB(x) x.r = DECODE_EP_COMPONENT(); x.g = DECODE_EP_COMPONENT(); x.b = DECODE_EP_COMPONENT(); x.a = 1.0f
@@ -489,36 +523,42 @@ void main() {
         decode_offset = 27;
         uint decoded_seed = get_bits(my_packed_block, 17, 10);
         uint decoded_mask = texelFetch(g_lut_seed_to_mask, int(decoded_seed)).r;
-        uint decoded_partition = (decoded_mask >> pixel_idx) & 1u;
+        decoded_partition = (decoded_mask >> pixel_idx) & 1u;
 
-        vec4 decoded_Ec, decoded_Ed;
 
         if (is_transparent) {
             // Decode 2P RGBA block (R8/R8, 3-bit/3-bit)
             // Endpoints: 16 channels * 3 bits = 48 bits @ offset 27
-            decode_ep_bits = 3;
             DECODE_EP_RGBA(decoded_Ea);
             DECODE_EP_RGBA(decoded_Eb);
             DECODE_EP_RGBA(decoded_Ec);
             DECODE_EP_RGBA(decoded_Ed);
 
             // Weights: 16 weights * 3 bits = 48 bits @ offset 80
-            uint weight_offset = 128 - (pixel_idx + 1) * 3;
-            decoded_weight_idx = get_bits(my_packed_block, weight_offset, 3);
+            uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
+            decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
 
         } else {
-            // Decode 2P RGB block (R16/R8, 4-bit/3-bit)
-            // Endpoints: 12 channels * 4 bits = 48 bits @ offset 27
-            decode_ep_bits = 4;
+            // Decode 2P RGB block (R32/R8, 4-bit/3-bit)
+            // Endpoints: 12 channels * 5 bits = 60 bits @ offset 27
             DECODE_EP_RGB(decoded_Ea);
             DECODE_EP_RGB(decoded_Eb);
             DECODE_EP_RGB(decoded_Ec);
             DECODE_EP_RGB(decoded_Ed);
 
             // Weights: 16 weights * 3 bits = 48 bits @ offset 80
-            uint weight_offset = 128 - (pixel_idx + 1) * 3;
-            decoded_weight_idx = get_bits(my_packed_block, weight_offset, 3);
+            uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
+            decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
         }
+
+        // No quantization test
+        // decoded_Ea = Ea;
+        // decoded_Eb = Eb;
+        // decoded_Ec = Ec;
+        // decoded_Ed = Ed;
+        // weight_bits = 8;
+        // decoded_partition = (ideal_map_int >> pixel_idx) & 1u;
+        // decoded_weight_idx = quantize_to_index(decoded_partition == 0 ? proj1 : proj2, weight_bits);
 
         if (decoded_partition == 1) {
             decoded_Ea = decoded_Ec;
@@ -526,7 +566,6 @@ void main() {
         }
     } else {
         decode_offset = 17;
-        decode_ep_bits = 5;
         if (is_transparent) {
             // Decode RGBA block (R32/R16, 5-bit/4-bit)
             // Endpoints: 8 channels * 5 bits = 40 bits @ offset 17
@@ -534,8 +573,8 @@ void main() {
             DECODE_EP_RGBA(decoded_Eb);
 
             // Weights: 16 weights * 4 bits = 64 bits @ offset 64
-            uint weight_offset = 128 - (pixel_idx + 1) * 4;
-            decoded_weight_idx = get_bits(my_packed_block, weight_offset, 4);
+            uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
+            decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
         } else {
             // Decode RGB block (R32/R32, 5-bit/5-bit)
             // Endpoints: 6 channels * 5 bits = 30 bits @ offset 17
@@ -543,19 +582,38 @@ void main() {
             DECODE_EP_RGB(decoded_Eb);
 
             // Weights: 16 weights * 5 bits = 80 bits @ offset 48
-            uint weight_offset = 128 - (pixel_idx + 1) * 5;
-            decoded_weight_idx = get_bits(my_packed_block, weight_offset, 5);
+            uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
+            decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
         }
     }
 
+
+    // if (true) {
+    //     // No quantization test
+    //     // decoded_Ea = Ea;
+    //     // decoded_Eb = Eb;
+    //     // decoded_Ec = Ec;
+    //     // decoded_Ed = Ed;
+    //     // weight_bits = 8;
+    //     // decoded_partition = ideal_partition_idx;
+    //     // decoded_weight_idx = quantize_to_index(decoded_partition == 0 ? proj1 : proj2, weight_bits);
+    // }
+
     float w = dequantize_from_index(decoded_weight_idx, weight_bits);
-    // w = dequantize_from_index(s_final_q_weights[lane_id], weight_bits); // DEBUG - original quantized pixel
 
     // LERP the final color
     vec4 final_color = mix(decoded_Ea, decoded_Eb, w);
     // if (needs_2p) {
-    //     final_color = mix(final_color, vec4(1.0, 0.0, 1.0, 1.0), 0.5);
-    //     // final_color = vec4(1.0, 0.0, 1.0, 1.0);
+    //     if (decoded_partition == 0) {
+    //         final_color = mix(final_color, vec4(0.0, 1.0, 0.0, 1.0), 0.15);
+    //     } else {
+    //         final_color = mix(final_color, vec4(1.0, 0, 1.0, 1.0), 0.15);
+    //     }
+
+    //     if (ideal_partition_idx != decoded_partition) {
+    //         g_out_decoded_pixels[global_block_id * 16 + pixel_idx] = decoded_partition == 0 ? vec4(0,1,0,1) : vec4(1,0,1,1);
+    //         return;
+    //     }
     // }
     g_out_decoded_pixels[global_block_id * 16 + pixel_idx] = final_color;
 }
