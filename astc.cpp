@@ -190,6 +190,7 @@ private:
     std::string input_file;
 
 public:
+    bool aabb = false;
     void run(const char* filename = "screenshot.jpg") {
         input_file = filename;
         imageData = prepare_input_data(filename);
@@ -391,7 +392,7 @@ public:
         void* data;
         vkMapMemory(device, stagingBufferMemory, 0, uniformBufferSize, 0, &data);
         memcpy(data, &imageData.totalBlocks, sizeof(uint32_t));
-        (static_cast<uint32_t*>(data))[1] = 1; // Use PCA
+        (static_cast<uint32_t*>(data))[1] = aabb ? 0 : 1; // Use PCA
         (static_cast<float*>(data))[2] = 0.1f; // Use 2-partition mode if the width of the point cloud is ~0.1 color step or more away
         vkUnmapMemory(device, stagingBufferMemory);
         copyBuffer(stagingBuffer, uniformBuffer, uniformBufferSize);
@@ -765,7 +766,7 @@ public:
         std::vector<float> decodedResult(decodedBufferSize / sizeof(float));
         memcpy(decodedResult.data(), mappedMemory, decodedBufferSize);
         vkUnmapMemory(device, readbackDecodedMemory);
-        auto output_file = std::string("decoded_") + input_file;
+        auto output_file = std::string("decoded_") + (aabb ? "aabb_" : "") + input_file;
         save_decoded_image(output_file.c_str(), decodedResult, imageData.originalWidth, imageData.originalHeight);
     }
 
@@ -814,6 +815,7 @@ int main() {
         app.run("screenshot.jpg");
         app.run("pixelzombie.jpg");
         app.run("example.jpg");
+        app.run("rogue_texture.png");
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;

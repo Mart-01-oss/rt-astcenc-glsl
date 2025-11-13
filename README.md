@@ -16,35 +16,58 @@ A fundamental tradeoff we'll always have to be wary of is that between color var
 #### Screenshot 1
 
 **Original**
+
 ![screenshot.jpg](screenshot.jpg)
 
 **ASTC Encoded w/ naive aabb fast mode**
-![decoded_screenshot.png](decoded_screenshot_aabb.jpg)
+
+![decoded_screenshot.png](decoded_aabb_screenshot.jpg)
 
 **ASTC Encoded w/ PCA+2P optimization**
+
 ![decoded_screenshot.png](decoded_screenshot.jpg)
 
 #### Screenshot 2
 
 **Original**
+
 ![pixelzombie.jpg](pixelzombie.jpg)
 
 **ASTC Encoded w/ naive aabb fast mode**
-![decoded_pixelzombie.png](decoded_pixelzombie_aabb.jpg)
+
+![decoded_pixelzombie.png](decoded_aabb_pixelzombie.jpg)
 
 **ASTC Encoded w/ PCA+2P optimization**
+
 ![decoded_pixelzombie.png](decoded_pixelzombie.jpg)
 
 #### High/Low Frequency Example
 
 **Original**
+
 ![example.jpg](example.jpg)
 
 **ASTC Encoded w/ naive aabb fast mode**
-![decoded_example.jpn](decoded_example_aabb.jpg)
+
+![decoded_example.jpn](decoded_aabb_example.jpg)
 
 **ASTC Encoded w/ PCA+2P optimization**
+
 ![decoded_example.png](decoded_example.jpg)
+
+#### Gradient Example
+
+**Original**
+
+![example.jpg](rogue_texture.png)
+
+**ASTC Encoded w/ naive aabb fast mode**
+
+![decoded_example.jpn](decoded_aabb_rogue_texture.png)
+
+**ASTC Encoded w/ PCA+2P optimization**
+
+![decoded_example.png](decoded_rogue_texture.png)
 
 #### Runtime
 
