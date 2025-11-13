@@ -811,11 +811,13 @@ public:
 
 int main() {
     ASTCComputeApp app;
+    app.aabb = false;
     try {
         app.run("screenshot.jpg");
         app.run("pixelzombie.jpg");
         app.run("example.jpg");
         app.run("rogue_texture.png");
+        app.run("cat.jpg");
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;

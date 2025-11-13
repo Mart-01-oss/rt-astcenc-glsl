@@ -69,6 +69,20 @@ A fundamental tradeoff we'll always have to be wary of is that between color var
 
 ![decoded_example.png](decoded_rogue_texture.png)
 
+#### Cat Quest 2 Example
+
+**Original**
+
+![example.jpg](cat.jpg)
+
+**ASTC Encoded w/ naive aabb fast mode**
+
+![decoded_example.jpn](decoded_aabb_cat.jpg)
+
+**ASTC Encoded w/ PCA+2P optimization**
+
+![decoded_example.png](decoded_cat.jpg)
+
 #### Runtime
 
 **With parallelized astc packing**
